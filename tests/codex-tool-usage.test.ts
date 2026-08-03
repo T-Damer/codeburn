@@ -19,13 +19,14 @@ async function writeRollout(home: string, sessionId: string, lines: unknown[], s
   await writeFile(file, lines.map((line) => JSON.stringify(line)).join('\n') + '\n')
 }
 
-function meta(sessionId: string, parentSessionId?: string): unknown {
+function meta(sessionId: string, parentSessionId?: string, subagent = Boolean(parentSessionId)): unknown {
   return {
     type: 'session_meta',
     timestamp: '2026-08-03T19:00:00.000Z',
     payload: {
       session_id: sessionId,
       ...(parentSessionId ? { forked_from_id: parentSessionId } : {}),
+      ...(subagent && parentSessionId ? { parent_thread_id: parentSessionId, thread_source: 'subagent', agent_path: '/root/exploration' } : {}),
       cwd: '/tmp/project',
       originator: 'codex_cli_rs',
     },
@@ -125,6 +126,41 @@ describe('Codex tool attribution', () => {
     expect(report.rows.find((row) => row.tool === 'Read')!.contextExposureTokens).toBe(10)
   })
 
+  it('counts completed provider-native tool calls without a separate output item', async () => {
+    const home = await fixtureHome()
+    await writeRollout(home, PARENT_ID, [
+      meta(PARENT_ID),
+      {
+        type: 'response_item',
+        timestamp: '2026-08-03T19:00:01.000Z',
+        payload: { type: 'web_search_call', id: 'ws-1', status: 'completed', action: { query: 'Codex rollout format' } },
+      },
+      tokenCount('2026-08-03T19:00:02.000Z', 200, 100, 30, 5, 200),
+    ])
+
+    const report = await analyzeCodexToolUsage({ codexHome: home })
+    const search = report.rows.find((row) => row.tool === 'WebSearch')
+    expect(search?.calls).toBe(1)
+    expect(search?.failedCalls).toBe(0)
+    expect(search?.nextRequest.inputTokens).toBe(200)
+  })
+
+  it('does not treat an ordinary fork as a spawned subagent', async () => {
+    const home = await fixtureHome()
+    await writeRollout(home, PARENT_ID, [
+      meta(PARENT_ID),
+      tokenCount('2026-08-03T19:00:03.000Z', 100, 50, 10, 0, 100),
+    ], '00')
+    await writeRollout(home, CHILD_ID, [
+      meta(CHILD_ID, PARENT_ID, false),
+      tokenCount('2026-08-03T19:00:05.000Z', 400, 300, 80, 20, 400),
+    ], '01')
+
+    const report = await analyzeCodexToolUsage({ codexHome: home, session: PARENT_ID.slice(0, 8) })
+    expect(report.sessionsAnalyzed).toBe(1)
+    expect(report.rows.find((row) => row.tool === 'spawn_agent')).toBeUndefined()
+  })
+
   it('links a child rollout to spawn_agent and includes its direct token usage', async () => {
     const home = await fixtureHome()
     await writeRollout(home, PARENT_ID, [
@@ -135,7 +171,9 @@ describe('Codex tool attribution', () => {
     ], '00')
     await writeRollout(home, CHILD_ID, [
       meta(CHILD_ID, PARENT_ID),
-      tokenCount('2026-08-03T19:00:05.000Z', 400, 300, 80, 20, 400),
+      // Replayed parent usage must not be charged to the child.
+      tokenCount('2026-08-03T19:00:01.000Z', 100, 50, 10, 0, 100),
+      tokenCount('2026-08-03T19:00:05.000Z', 400, 300, 80, 20, 500),
     ], '01')
 
     const report = await analyzeCodexToolUsage({ codexHome: home, session: PARENT_ID.slice(0, 8) })
