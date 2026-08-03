@@ -75,6 +75,9 @@ type SessionMeta = {
   parentSessionId?: string
   project?: string
   startedAt?: string
+  threadSource?: string
+  agentPath?: string
+  isSubagent: boolean
 }
 
 type ParsedSession = {
@@ -102,6 +105,11 @@ type CodexEntry = {
     cwd?: string
     session_id?: string
     forked_from_id?: string
+    parent_thread_id?: string
+    thread_source?: string
+    agent_path?: string
+    agent_role?: string
+    status?: string
     arguments?: unknown
     input?: unknown
     action?: unknown
@@ -186,7 +194,11 @@ function normalizeToolName(raw: string, payloadType?: string): string {
   if (raw === 'read_file') return 'Read'
   if (raw === 'write_file' || raw === 'apply_diff' || raw === 'apply_patch' || raw === 'patch_apply_end') return 'Edit'
   if (raw === 'read_dir') return 'Glob'
-  if (payloadType === 'web_search_call' || raw === 'web_search') return 'WebSearch'
+  if (payloadType === 'web_search_call' || raw === 'web_search' || raw === 'web_search_call') return 'WebSearch'
+  if (raw === 'file_search' || raw === 'file_search_call') return 'FileSearch'
+  if (raw === 'image_generation' || raw === 'image_generation_call') return 'ImageGeneration'
+  if (raw === 'computer' || raw === 'computer_call') return 'Computer'
+  if (raw === 'shell' || raw === 'shell_call') return 'Bash'
   return raw || payloadType || 'unknown'
 }
 
@@ -295,10 +307,15 @@ function parseLargeLine(line: Buffer): { entry?: CodexEntry; estimatedOutputToke
       name: rawStringField(payloadHead, 'name'),
       session_id: rawStringField(payloadHead, 'session_id'),
       forked_from_id: rawStringField(payloadHead, 'forked_from_id'),
+      parent_thread_id: rawStringField(payloadHead, 'parent_thread_id'),
+      thread_source: rawStringField(payloadHead, 'thread_source'),
+      agent_path: rawStringField(payloadHead, 'agent_path'),
+      agent_role: rawStringField(payloadHead, 'agent_role'),
+      status: rawStringField(payloadHead, 'status'),
       cwd: rawStringField(payloadHead, 'cwd'),
     },
   }
-  const isOutput = payloadType === 'function_call_output' || payloadType === 'custom_tool_call_output' || payloadType === 'local_shell_call_output'
+  const isOutput = payloadType === 'function_call_output' || payloadType === 'custom_tool_call_output' || payloadType === 'local_shell_call_output' || Boolean(payloadType?.endsWith('_call_output'))
   return { entry, ...(isOutput ? { estimatedOutputTokens: estimateTokensFromChars(line.length) } : {}) }
 }
 
@@ -351,7 +368,7 @@ async function listRollouts(root: string): Promise<RolloutRef[]> {
 }
 
 async function readSessionMeta(ref: RolloutRef, maxJsonLineBytes: number): Promise<SessionMeta> {
-  const meta: SessionMeta = { sessionId: ref.sessionId }
+  const meta: SessionMeta = { sessionId: ref.sessionId, isSubagent: false }
   for await (const line of readSessionLines(ref.filePath, undefined, { largeLineAsBuffer: true })) {
     const parsed = parseLine(line, maxJsonLineBytes)
     const entry = parsed.entry
@@ -359,8 +376,23 @@ async function readSessionMeta(ref: RolloutRef, maxJsonLineBytes: number): Promi
     if (entry.type === 'session_meta') {
       const sessionId = entry.payload?.session_id
       if (typeof sessionId === 'string' && sessionId) meta.sessionId = sessionId
-      const parent = entry.payload?.forked_from_id
-      if (typeof parent === 'string' && parent) meta.parentSessionId = parent
+      const parentThreadId = entry.payload?.parent_thread_id
+      const forkedFromId = entry.payload?.forked_from_id
+      const parent = typeof parentThreadId === 'string' && parentThreadId
+        ? parentThreadId
+        : typeof forkedFromId === 'string' && forkedFromId
+          ? forkedFromId
+          : undefined
+      if (parent) meta.parentSessionId = parent
+      const threadSource = entry.payload?.thread_source
+      if (typeof threadSource === 'string' && threadSource) meta.threadSource = threadSource
+      const agentPath = entry.payload?.agent_path
+      if (typeof agentPath === 'string' && agentPath) meta.agentPath = agentPath
+      const agentRole = entry.payload?.agent_role
+      meta.isSubagent = meta.threadSource?.toLowerCase() === 'subagent'
+        || Boolean(typeof parentThreadId === 'string' && parentThreadId)
+        || Boolean(meta.agentPath)
+        || Boolean(typeof agentRole === 'string' && agentRole)
       const cwd = entry.payload?.cwd
       if (typeof cwd === 'string' && cwd) meta.project = cwd
       meta.startedAt = entry.timestamp
@@ -396,6 +428,9 @@ async function parseSession(ref: RolloutRef, meta: SessionMeta, maxJsonLineBytes
   let cumulative = cloneUsage()
   let sawCumulative = false
   let previousCumulativeSignature = ''
+  const forkReplayCutoffMs = meta.parentSessionId && meta.startedAt
+    ? (timestampMs(meta.startedAt) ?? 0) + 5000
+    : undefined
   let sequence = 0
   let parseErrors = 0
   let oversizedLinesEstimated = 0
@@ -423,34 +458,65 @@ async function parseSession(ref: RolloutRef, meta: SessionMeta, maxJsonLineBytes
     if (!entry || !payload) continue
     const payloadType = payload.type
 
-    if (entry.type === 'compacted') {
+    const eventTime = timestampMs(entry.timestamp)
+    const isForkReplay = forkReplayCutoffMs !== undefined && eventTime !== undefined && eventTime < forkReplayCutoffMs
+    if (isForkReplay) {
+      // Codex forks replay the parent's history into the child rollout with
+      // timestamps clustered at creation. Preserve only the cumulative token
+      // baseline so the first child event without last_token_usage can still
+      // be differenced correctly; do not count replayed calls or usage.
+      if (entry.type === 'event_msg' && payloadType === 'token_count') {
+        const replayTotal = usageFromRecord(payload.info?.total_token_usage as Record<string, unknown> | undefined)
+        if (totalUsageTokens(replayTotal) > 0) {
+          cumulative = replayTotal
+          sawCumulative = true
+          previousCumulativeSignature = `${replayTotal.inputTokens}:${replayTotal.cachedInputTokens}:${replayTotal.outputTokens}:${replayTotal.reasoningTokens}`
+        }
+      }
+      continue
+    }
+
+    if (entry.type === 'compacted' || (entry.type === 'event_msg' && payloadType === 'context_compacted')) {
       liveContext.clear()
       continue
     }
 
+    const isBuiltinCall = typeof payloadType === 'string'
+      && payloadType.endsWith('_call')
+      && payloadType !== 'function_call'
+      && payloadType !== 'custom_tool_call'
     if (entry.type === 'response_item' && (
       payloadType === 'function_call' ||
       payloadType === 'custom_tool_call' ||
       payloadType === 'local_shell_call' ||
-      payloadType === 'web_search_call'
+      isBuiltinCall
     )) {
       const rawTool = typeof payload.name === 'string' && payload.name
         ? payload.name
         : payloadType === 'local_shell_call'
           ? 'exec_command'
-          : payloadType === 'web_search_call'
-            ? 'web_search'
+          : isBuiltinCall
+            ? payloadType!.slice(0, -'_call'.length)
             : 'unknown'
-      const argumentValue = payload.arguments ?? payload.input ?? payload.action ?? ''
-      const invocation = newInvocation(meta, entry, rawTool, argumentValue, ++sequence)
-      openCalls.set(invocation.callId, invocation)
+      const argumentValue = payload.arguments ?? payload.input ?? payload.action ?? payload['queries'] ?? ''
+      const id = invocationId(payload, `${meta.sessionId}:tool-${sequence + 1}`)
+      const invocation = openCalls.get(id) ?? newInvocation(meta, entry, rawTool, argumentValue, ++sequence)
+      const status = typeof payload.status === 'string' ? payload.status.toLowerCase() : ''
+      if (isBuiltinCall && (status === 'completed' || status === 'failed')) {
+        openCalls.delete(id)
+        finishInvocation(invocation, entry, outputValue(payload), parsed.estimatedOutputTokens)
+        invocation.failed ||= status === 'failed' || failedResult(payload)
+      } else {
+        openCalls.set(invocation.callId, invocation)
+      }
       continue
     }
 
     if (entry.type === 'response_item' && (
       payloadType === 'function_call_output' ||
       payloadType === 'custom_tool_call_output' ||
-      payloadType === 'local_shell_call_output'
+      payloadType === 'local_shell_call_output' ||
+      (typeof payloadType === 'string' && payloadType.endsWith('_call_output'))
     )) {
       const id = invocationId(payload, '')
       const invocation = openCalls.get(id) ?? newInvocation(meta, entry, 'unknown', '', ++sequence)
@@ -475,7 +541,8 @@ async function parseSession(ref: RolloutRef, meta: SessionMeta, maxJsonLineBytes
       const invocation = newInvocation(meta, entry, rawTool, invocationRecord?.['arguments'] ?? '', ++sequence)
       const duration = payload['duration_ms']
       if (typeof duration === 'number' && Number.isFinite(duration) && duration >= 0) invocation.durationMs = duration
-      finishInvocation(invocation, entry, payload['result'] ?? payload['output'] ?? payload, undefined)
+      finishInvocation(invocation, entry, payload['result'] ?? payload['output'] ?? payload['content'] ?? '', undefined)
+      invocation.failed ||= failedResult(payload)
       continue
     }
 
@@ -528,7 +595,7 @@ function descendantsOf(rootIds: Set<string>, metas: Map<string, SessionMeta>): S
   while (changed) {
     changed = false
     for (const meta of metas.values()) {
-      if (meta.parentSessionId && selected.has(meta.parentSessionId) && !selected.has(meta.sessionId)) {
+      if (meta.isSubagent && meta.parentSessionId && selected.has(meta.parentSessionId) && !selected.has(meta.sessionId)) {
         selected.add(meta.sessionId)
         changed = true
       }
@@ -562,7 +629,7 @@ function linkSubagents(sessions: ParsedSession[]): void {
   const byId = new Map(sessions.map((session) => [session.meta.sessionId, session]))
   const assigned = new Set<CodexToolInvocation>()
   for (const child of sessions) {
-    if (!child.meta.parentSessionId) continue
+    if (!child.meta.isSubagent || !child.meta.parentSessionId) continue
     const parent = byId.get(child.meta.parentSessionId)
     if (!parent) continue
     let target = parent.invocations.find((invocation) =>
