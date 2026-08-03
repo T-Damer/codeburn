@@ -9,7 +9,10 @@ if (major < 22 || (major === 22 && minor < 13)) {
   process.exit(1)
 }
 
-import('./main.js').catch((err) => {
+// Keep detailed Codex attribution isolated from the main dashboard bundle. This
+// also lets `codeburn tools --help` start without scanning every provider.
+const entry = process.argv[2] === 'tools' ? './codex-tools-cli.js' : './main.js'
+import(entry).catch((err) => {
   process.stderr.write(String(err?.message ?? err) + '\n')
   process.exit(1)
 })
