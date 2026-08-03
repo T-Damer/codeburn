@@ -4,8 +4,46 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.13.1
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test -- --run
+
+      - name: Build CLI and dashboard
+        run: npm run build
+
+      - name: Smoke-test detailed Codex tools command
+        run: node dist/cli.js tools --help
+
+      - name: Pack installable artifact
+        run: npm pack --ignore-scripts
+
+      - name: Upload npm package
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeburn-npm-package
+          path: codeburn-*.tgz
+          if-no-files-found: error
+          retention-days: 14
+
   semgrep:
     runs-on: ubuntu-latest
     steps:
